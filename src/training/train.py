@@ -1,4 +1,4 @@
-"""Training script for BaselineUNet on HDRDataset."""
+"""Training script for RLUNet and BaselineUNet on HDRDataset."""
 
 import argparse
 import json
@@ -20,6 +20,7 @@ import yaml
 
 from src.data.dataset import HDRDataset
 from src.models.baseline_unet import BaselineUNet
+from src.models.rlunet import RLUNet
 
 
 def load_config(config_path: Optional[str]) -> Dict[str, Any]:
@@ -34,7 +35,14 @@ def load_config(config_path: Optional[str]) -> Dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments with fallback to YAML config defaults."""
     parser = argparse.ArgumentParser(
-        description="Train BaselineUNet for single-image HDR reconstruction."
+        description="Train RLUNet or BaselineUNet for single-image HDR reconstruction."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="rlunet",
+        choices=["baseline", "rlunet"],
+        help="Model architecture to train (choices: 'baseline', 'rlunet'; default: 'rlunet').",
     )
     parser.add_argument(
         "--config",
@@ -265,6 +273,7 @@ def validate(
 
 def train(
     config_path: Optional[str] = None,
+    model_name: Optional[str] = None,
     data_dir: Optional[str] = None,
     checkpoint_dir: Optional[str] = None,
     epochs: Optional[int] = None,
@@ -285,6 +294,22 @@ def train(
     # Resolve settings (CLI arguments take precedence over YAML config)
     seed = seed if seed is not None else cfg.get("seed", 42)
     set_seed(seed)
+
+    # Resolve model architecture ("rlunet" or "baseline", default: "rlunet")
+    raw_model = (
+        model_name
+        or cfg.get("model", {}).get("name")
+        or "rlunet"
+    )
+    model_type = raw_model.strip().lower()
+    if model_type in ("baseline", "baselineunet", "baseline_unet"):
+        model_type = "baseline"
+    elif model_type in ("rlunet", "rl_unet", "imagingpipelinemodule", "ipm"):
+        model_type = "rlunet"
+    else:
+        raise ValueError(
+            f"Unsupported model type '{raw_model}'. Expected 'baseline' or 'rlunet'."
+        )
 
     data_dir = (
         data_dir
@@ -338,9 +363,12 @@ def train(
     else:
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    model_display_name = "RLUNet" if model_type == "rlunet" else "BaselineUNet"
+
     print("=" * 65)
-    print("RLUNet Project - BaselineUNet Training")
+    print(f"RLUNet Project - {model_display_name} Training")
     print("=" * 65)
+    print(f"Model:            {model_display_name} ({model_type})")
     print(f"Device:           {target_device}")
     print(f"Data Directory:   {data_dir}")
     print(f"Checkpoints:      {checkpoint_dir}")
@@ -378,12 +406,23 @@ def train(
     )
 
     # 2. Instantiate Model (3-channel LDR in -> 3-channel HDR out, linear)
-    base_channels = cfg.get("model", {}).get("base_channels", 64)
-    model = BaselineUNet(
-        in_channels=3,
-        out_channels=3,
-        base_channels=base_channels,
-    ).to(target_device)
+    base_channels = cfg.get("model", {}).get("base_channels", 32 if model_type == "rlunet" else 64)
+    if model_type == "rlunet":
+        model = RLUNet(
+            in_channels=3,
+            out_channels=3,
+            base_channels=base_channels,
+        ).to(target_device)
+    else:
+        model = BaselineUNet(
+            in_channels=3,
+            out_channels=3,
+            base_channels=base_channels,
+        ).to(target_device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Parameters: {total_params:,} (Trainable: {trainable_params:,})")
 
     # 3. Loss function & Optimizer
     criterion = nn.L1Loss()
@@ -484,6 +523,7 @@ def train(
         if should_save_periodic or is_best:
             checkpoint_state = {
                 "epoch": epoch,
+                "model_name": model_type,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
@@ -530,6 +570,7 @@ def main():
     args = parse_args()
     train(
         config_path=args.config,
+        model_name=args.model,
         data_dir=args.data_dir,
         checkpoint_dir=args.checkpoint_dir,
         epochs=args.epochs,
