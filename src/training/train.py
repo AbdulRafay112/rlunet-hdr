@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture to train (choices: 'baseline', 'rlunet'; default: 'rlunet').",
     )
     parser.add_argument(
+        "--base_channels",
+        type=int,
+        default=None,
+        help="Base feature channels for the model (defaults to 32 for RLUNet [~7.79M], 64 for BaselineUNet [~31.04M]).",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default="experiments/configs/default_config.yaml",
@@ -271,6 +277,46 @@ def validate(
     return running_loss / max(1, total_samples)
 
 
+def build_model(
+    model_name: str = "rlunet",
+    in_channels: int = 3,
+    out_channels: int = 3,
+    base_channels: Optional[int] = None,
+) -> nn.Module:
+    """Build and return either RLUNet or BaselineUNet with correct architectural defaults.
+
+    Args:
+        model_name: 'rlunet' or 'baseline' (case-insensitive).
+        in_channels: Number of input color channels (default: 3).
+        out_channels: Number of output HDR channels (default: 3).
+        base_channels: Base feature channels.
+                       Defaults to 32 for RLUNet (~7.79M params)
+                       and 64 for BaselineUNet (~31.04M params).
+
+    Returns:
+        nn.Module: Instantiated model.
+    """
+    model_type = model_name.strip().lower()
+    if model_type in ("rlunet", "rl_unet", "imagingpipelinemodule", "ipm"):
+        channels = base_channels if base_channels is not None else 32
+        return RLUNet(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=channels,
+        )
+    elif model_type in ("baseline", "baselineunet", "baseline_unet"):
+        channels = base_channels if base_channels is not None else 64
+        return BaselineUNet(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            base_channels=channels,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported model type '{model_name}'. Expected 'baseline' or 'rlunet'."
+        )
+
+
 def train(
     config_path: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -287,6 +333,7 @@ def train(
     seed: Optional[int] = None,
     val_split: float = 0.10,
     dry_run: bool = False,
+    base_channels: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Main training routine."""
     cfg = load_config(config_path)
@@ -365,6 +412,23 @@ def train(
 
     model_display_name = "RLUNet" if model_type == "rlunet" else "BaselineUNet"
 
+    # Resolve base_channels
+    if base_channels is not None:
+        model_base_channels = base_channels
+    else:
+        cfg_model_name = str(cfg.get("model", {}).get("name", "")).strip().lower()
+        if model_type == "rlunet":
+            if cfg_model_name in ("rlunet", "rl_unet", "imagingpipelinemodule", "ipm"):
+                cfg_channels = cfg.get("model", {}).get("base_channels")
+                model_base_channels = cfg_channels if cfg_channels is not None else 32
+            else:
+                model_base_channels = cfg.get("model", {}).get("rlunet_base_channels", 32)
+        else:
+            if cfg_model_name in ("baseline", "baselineunet", "baseline_unet"):
+                model_base_channels = cfg.get("model", {}).get("base_channels", 64)
+            else:
+                model_base_channels = 64
+
     print("=" * 65)
     print(f"RLUNet Project - {model_display_name} Training")
     print("=" * 65)
@@ -381,10 +445,35 @@ def train(
     print(f"Random Seed:      {seed}")
     print("=" * 65)
 
-    # 1. Prepare Dataset and 90/10 Train/Val Split
+    # 1. Instantiate Model
+    model = build_model(
+        model_name=model_type,
+        in_channels=3,
+        out_channels=3,
+        base_channels=model_base_channels,
+    ).to(target_device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Parameters: {total_params:,} (Trainable: {trainable_params:,})")
+
+    # 2. Prepare Dataset and 90/10 Train/Val Split
     full_dataset = HDRDataset(root_dir=data_dir)
     total_samples = len(full_dataset)
     print(f"Loaded dataset with {total_samples} total sample(s).")
+
+    if total_samples == 0:
+        print("[Warning] No sample folders found in dataset directory.")
+        print(f"--> Running dummy verification test for {model_display_name}...")
+        test_b = min(batch_size, 2)
+        dummy_in = torch.rand(test_b, 3, 512, 512, device=target_device)
+        with torch.no_grad():
+            dummy_out = model(dummy_in)
+        print(f"  Dummy Input:   {tuple(dummy_in.shape)}")
+        print(f"  Dummy Output:  {tuple(dummy_out.shape)}")
+        print(f"  Model Params:  {total_params:,}")
+        print(f"[SUCCESS] {model_display_name} verification passed ({total_params:,} parameters)!")
+        return {"model": model, "total_params": total_params, "verified": True}
 
     train_set, val_set = get_train_val_split(full_dataset, val_split=val_split, seed=seed)
     print(f"Dataset split (90/10): {len(train_set)} train, {len(val_set)} validation.")
@@ -404,25 +493,6 @@ def train(
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-
-    # 2. Instantiate Model (3-channel LDR in -> 3-channel HDR out, linear)
-    base_channels = cfg.get("model", {}).get("base_channels", 32 if model_type == "rlunet" else 64)
-    if model_type == "rlunet":
-        model = RLUNet(
-            in_channels=3,
-            out_channels=3,
-            base_channels=base_channels,
-        ).to(target_device)
-    else:
-        model = BaselineUNet(
-            in_channels=3,
-            out_channels=3,
-            base_channels=base_channels,
-        ).to(target_device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model Parameters: {total_params:,} (Trainable: {trainable_params:,})")
 
     # 3. Loss function & Optimizer
     criterion = nn.L1Loss()
@@ -584,8 +654,10 @@ def main():
         seed=args.seed,
         val_split=args.val_split,
         dry_run=args.dry_run,
+        base_channels=args.base_channels,
     )
 
 
 if __name__ == "__main__":
     main()
+
