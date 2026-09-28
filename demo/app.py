@@ -3,7 +3,10 @@
 Loads trained RLUNet weights from models/checkpoints/rlunet_final.pth on CPU,
 accepts an uploaded photo, resizes it to 512x512, normalizes to [0, 1], runs
 RLUNet inference under torch.no_grad, clamps output to [0, 16], and displays the
-mu-law tone-mapped result alongside the input image.
+reconstructed HDR image using selectable display tone-mapping modes:
+  1. 'Natural (gamma)' (default): normalized by 99th percentile of per-pixel luminance,
+     clamped to [0, 1], and gamma-corrected (1/2.2).
+  2. 'Mu-law (as in evaluation)': normalized by max radiance, tone-mapped with mu=5000.
 """
 
 import argparse
@@ -26,6 +29,8 @@ from src.models.rlunet import RLUNet
 from src.utils.tonemap import mu_law_tonemap
 
 DEFAULT_CHECKPOINT = os.path.join(project_root, "models", "checkpoints", "rlunet_final.pth")
+MODE_NATURAL = "Natural (gamma)"
+MODE_MULAW = "Mu-law (as in evaluation)"
 
 
 def load_rlunet_model(checkpoint_path: str = DEFAULT_CHECKPOINT) -> RLUNet:
@@ -51,21 +56,67 @@ def load_rlunet_model(checkpoint_path: str = DEFAULT_CHECKPOINT) -> RLUNet:
 model = load_rlunet_model()
 
 
+def apply_display_mode(
+    raw_hdr: np.ndarray,
+    mode: str = MODE_NATURAL,
+) -> Tuple[np.ndarray, str]:
+    """Convert raw predicted HDR radiance [0, 16] to a displayable uint8 RGB image.
+
+    Modes:
+      - 'Natural (gamma)':
+          Normalize by 99th percentile of per-pixel luminance, clamp to [0, 1],
+          and apply gamma correction (1/2.2).
+      - 'Mu-law (as in evaluation)':
+          Normalize by max radiance, apply mu-law tonemapping (mu=5000).
+
+    Note:
+      This function only alters how the HDR radiance is tone-mapped and displayed,
+      not the underlying raw predicted HDR values.
+    """
+    if raw_hdr is None:
+        return None, ""
+
+    if mode == MODE_NATURAL:
+        # Per-pixel luminance using Rec.709 coefficients
+        lum = (
+            0.2126 * raw_hdr[..., 0]
+            + 0.7152 * raw_hdr[..., 1]
+            + 0.0722 * raw_hdr[..., 2]
+        )
+        p99 = float(np.percentile(lum, 99))
+        scale = max(p99, 1e-6)
+        norm = np.clip(raw_hdr / scale, 0.0, 1.0)
+        gamma = np.power(norm, 1.0 / 2.2)
+        display_uint8 = np.clip(gamma * 255.0, 0, 255).astype(np.uint8)
+        details = (
+            f"Display: Natural (gamma 1/2.2) | 99th% Luminance Scale: {scale:.4f} | "
+            f"Max Radiance: {float(raw_hdr.max()):.2f}"
+        )
+    else:  # "Mu-law (as in evaluation)"
+        max_val = float(raw_hdr.max())
+        scale = max(max_val, 1e-6)
+        norm = raw_hdr / scale
+        tm = mu_law_tonemap(norm, mu=5000.0)
+        display_uint8 = np.clip(tm * 255.0, 0, 255).astype(np.uint8)
+        details = (
+            f"Display: Mu-law (mu=5000, normalized by max) | "
+            f"Max Radiance: {scale:.2f}"
+        )
+
+    return display_uint8, details
+
+
 def reconstruct_hdr(
     input_image: Optional[np.ndarray],
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
-    """Reconstruct HDR image from uploaded LDR photo.
+    display_mode: str = MODE_NATURAL,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str, Optional[np.ndarray]]:
+    """Reconstruct HDR image from uploaded LDR photo and apply selected display mode.
 
-    Steps:
-      1. Resize image to 512x512 RGB.
-      2. Convert to float32 in [0, 1] tensor of shape (1, 3, 512, 512).
-      3. Run RLUNet in eval mode under torch.no_grad().
-      4. Clamp predicted output to [0, 16].
-      5. Normalize output by its own max value, then tone-map with mu-law (mu=5000).
-      6. Return (512x512 input, tone-mapped output, metadata string).
+    Returns:
+      (resized_input, display_output, info_text, raw_hdr_array)
     """
     if input_image is None:
-        return None, None, "Please upload an image to begin reconstruction."
+        return None, None, "Please upload an image to begin reconstruction.", None
 
     # Ensure numpy array
     if not isinstance(input_image, np.ndarray):
@@ -100,22 +151,29 @@ def reconstruct_hdr(
     # 5. Clamp output to [0, 16]
     output_clamped = torch.clamp(output.float(), min=0.0, max=16.0)
 
-    # 6. Normalize by output's own max radiance and apply mu-law tonemapping (mu=5000)
-    max_val = output_clamped.max().item()
-    scale = max(float(max_val), 1e-6)
-    output_norm = output_clamped / scale
-    output_tm = mu_law_tonemap(output_norm, mu=5000.0)
+    # Store raw HDR predictions in numpy array: shape (512, 512, 3)
+    raw_hdr = output_clamped.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
-    # 7. Convert tone-mapped tensor back to uint8 RGB (512, 512, 3)
-    tm_np = output_tm.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    tm_uint8 = np.clip(tm_np * 255.0, 0, 255).astype(np.uint8)
+    # 6. Apply display tone mapping
+    display_img, mode_details = apply_display_mode(raw_hdr, mode=display_mode)
 
     info_text = (
-        f"Input: {orig_w}x{orig_h} (processed at 512x512) | "
-        f"Estimated Max Radiance: {scale:.2f} | "
-        f"Tone-mapping: mu-law (mu=5000, normalized by max)"
+        f"Input: {orig_w}x{orig_h} (processed at 512x512) | {mode_details}"
     )
-    return resized_input, tm_uint8, info_text
+    return resized_input, display_img, info_text, raw_hdr
+
+
+def on_display_mode_change(
+    raw_hdr: Optional[np.ndarray],
+    display_mode: str,
+) -> Tuple[Optional[np.ndarray], str]:
+    """Switch display mode on cached raw HDR predictions without re-running the model."""
+    if raw_hdr is None:
+        return None, "Upload and reconstruct an image first."
+
+    display_img, mode_details = apply_display_mode(raw_hdr, mode=display_mode)
+    info_text = f"Display mode updated (cached prediction) | {mode_details}"
+    return display_img, info_text
 
 
 def create_demo() -> gr.Blocks:
@@ -137,8 +195,14 @@ def create_demo() -> gr.Blocks:
                     label="Upload Photo (LDR)",
                     type="numpy",
                 )
+                display_mode = gr.Radio(
+                    choices=[MODE_NATURAL, MODE_MULAW],
+                    value=MODE_NATURAL,
+                    label="Display Mode",
+                    info="Note: Display mode only changes how the output is shown, not what the model predicts.",
+                )
                 reconstruct_btn = gr.Button("Reconstruct HDR", variant="primary", size="lg")
-                info_output = gr.Textbox(label="Inference Details", interactive=False)
+                info_output = gr.Textbox(label="Inference & Display Details", interactive=False)
 
             with gr.Column(scale=2):
                 with gr.Row():
@@ -147,19 +211,30 @@ def create_demo() -> gr.Blocks:
                         interactive=False,
                     )
                     preview_output = gr.Image(
-                        label="Reconstructed HDR (Tone-Mapped)",
+                        label="Reconstructed HDR",
                         interactive=False,
                     )
 
+        # Gradio state to hold raw predicted HDR radiance without re-running inference
+        raw_hdr_state = gr.State(None)
+
+        # Reconstruct on click or upload
         reconstruct_btn.click(
             fn=reconstruct_hdr,
-            inputs=[input_image],
-            outputs=[preview_input, preview_output, info_output],
+            inputs=[input_image, display_mode],
+            outputs=[preview_input, preview_output, info_output, raw_hdr_state],
         )
         input_image.upload(
             fn=reconstruct_hdr,
-            inputs=[input_image],
-            outputs=[preview_input, preview_output, info_output],
+            inputs=[input_image, display_mode],
+            outputs=[preview_input, preview_output, info_output, raw_hdr_state],
+        )
+
+        # Instant display mode switch without re-running the model
+        display_mode.change(
+            fn=on_display_mode_change,
+            inputs=[raw_hdr_state, display_mode],
+            outputs=[preview_output, info_output],
         )
 
     return demo
@@ -195,14 +270,28 @@ def main():
         print("\n--- Running CLI Terminal Test (Dummy Image) ---")
         dummy_img = np.random.randint(0, 256, (400, 600, 3), dtype=np.uint8)
         print(f"Input dummy shape: {dummy_img.shape}")
-        in_preview, out_tm, details = reconstruct_hdr(dummy_img)
-        print(f"Resized input shape: {in_preview.shape}")
-        print(f"Reconstructed tone-mapped output shape: {out_tm.shape}")
-        print(f"Details: {details}")
+
+        # Test Natural (gamma) default mode
+        in_preview, out_nat, details_nat, raw_hdr = reconstruct_hdr(dummy_img, display_mode=MODE_NATURAL)
+        print(f"Natural mode output shape: {out_nat.shape}, dtype: {out_nat.dtype}")
+        print(f"Details: {details_nat}")
         assert in_preview.shape == (512, 512, 3), f"Expected (512, 512, 3), got {in_preview.shape}"
-        assert out_tm.shape == (512, 512, 3), f"Expected (512, 512, 3), got {out_tm.shape}"
-        assert out_tm.dtype == np.uint8, f"Expected uint8, got {out_tm.dtype}"
-        print("[SUCCESS] Terminal inference test passed successfully!\n")
+        assert out_nat.shape == (512, 512, 3), f"Expected (512, 512, 3), got {out_nat.shape}"
+        assert out_nat.dtype == np.uint8, f"Expected uint8, got {out_nat.dtype}"
+        assert raw_hdr.shape == (512, 512, 3), f"Expected raw HDR shape (512, 512, 3), got {raw_hdr.shape}"
+
+        # Test switching to Mu-law mode using cached raw_hdr (no re-running model)
+        out_mu, details_mu = on_display_mode_change(raw_hdr, display_mode=MODE_MULAW)
+        print(f"Mu-law mode output shape: {out_mu.shape}, dtype: {out_mu.dtype}")
+        print(f"Details: {details_mu}")
+        assert out_mu.shape == (512, 512, 3), f"Expected (512, 512, 3), got {out_mu.shape}"
+        assert out_mu.dtype == np.uint8, f"Expected uint8, got {out_mu.dtype}"
+
+        # Verify that switching back to Natural produces the same output
+        out_nat2, _ = on_display_mode_change(raw_hdr, display_mode=MODE_NATURAL)
+        assert np.array_equal(out_nat, out_nat2), "Display mode switch should be deterministic!"
+
+        print("[SUCCESS] Terminal test verified both display modes and instant mode switching!\n")
     else:
         demo = create_demo()
         print(f"\nLaunching Gradio Demo on http://{args.host}:{args.port}...")
