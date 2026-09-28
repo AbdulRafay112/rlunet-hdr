@@ -297,11 +297,11 @@ def evaluate(
 
             with torch.no_grad():
                 pred = model(dummy_ldr)
-                pred_clamped = torch.clamp(pred, min=0.0)
+                pred_clamped = torch.clamp(pred.float(), min=0.0, max=16.0)
 
             # Mu-law tone mapping
             pred_tm = mu_law_tonemap(pred_clamped, mu=mu)
-            gt_tm = mu_law_tonemap(dummy_hdr, mu=mu)
+            gt_tm = mu_law_tonemap(dummy_hdr.float(), mu=mu)
 
             pred_tm_np = to_numpy_hwc(pred_tm)
             gt_tm_np = to_numpy_hwc(gt_tm)
@@ -368,11 +368,11 @@ def evaluate(
 
         with torch.no_grad():
             pred = model(ldr_img)
-            pred_clamped = torch.clamp(pred, min=0.0)
+            pred_clamped = torch.clamp(pred.float(), min=0.0, max=16.0)
 
         # Tone mapping
         pred_tm = mu_law_tonemap(pred_clamped, mu=mu)
-        gt_tm = mu_law_tonemap(hdr_gt, mu=mu)
+        gt_tm = mu_law_tonemap(hdr_gt.float(), mu=mu)
 
         pred_tm_np = to_numpy_hwc(pred_tm)
         gt_tm_np = to_numpy_hwc(gt_tm)

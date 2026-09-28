@@ -22,9 +22,17 @@ def mu_law_tonemap(
         Tone-mapped values in [0, 1], same type as input.
     """
     if isinstance(x, torch.Tensor):
-        x_clamped = torch.clamp(x, min=0.0)
-        denom = float(np.log(1.0 + mu))
-        return torch.log1p(mu * x_clamped) / denom
+        orig_dtype = x.dtype
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x_f32 = x.float()
+            x_clamped = torch.clamp(x_f32, min=0.0)
+            denom = float(np.log(1.0 + mu))
+            res = torch.log1p(mu * x_clamped) / denom
+            return res.to(orig_dtype)
+        else:
+            x_clamped = torch.clamp(x, min=0.0)
+            denom = float(np.log(1.0 + mu))
+            return torch.log1p(mu * x_clamped) / denom
     elif isinstance(x, np.ndarray):
         x_clamped = np.maximum(x, 0.0)
         denom = float(np.log(1.0 + mu))

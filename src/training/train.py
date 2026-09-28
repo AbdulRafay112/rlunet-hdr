@@ -13,6 +13,8 @@ project_root = str(Path(__file__).resolve().parents[2])
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,14 +30,23 @@ from src.utils.tonemap import mu_law_tonemap
 class MuLawLoss(nn.Module):
     """L1 loss in the mu-law tone-mapped domain: T(x) = log(1 + mu*x) / log(1 + mu)."""
 
-    def __init__(self, mu: float = 5000.0):
+    def __init__(self, mu: float = 5000.0, max_val: float = 16.0):
         super().__init__()
         self.mu = mu
+        self.max_val = max_val
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Clamp predictions to non-negative to avoid negative values inside log1p
-        pred_clamped = torch.clamp(pred, min=0.0)
-        target_clamped = torch.clamp(target, min=0.0)
+        # Cast to float32 to compute loss outside autocast in high precision
+        pred_f32 = pred.float()
+        target_f32 = target.float()
+
+        # Guard: if prediction or target contains inf/nan, produce non-finite loss for batch skipping
+        if not torch.isfinite(pred_f32).all() or not torch.isfinite(target_f32).all():
+            return torch.tensor(float("inf"), device=pred.device, dtype=torch.float32, requires_grad=True)
+
+        # Clamp predictions to [0, 16] before the mu-law transform (normalized targets are in [0, 1])
+        pred_clamped = torch.clamp(pred_f32, min=0.0, max=self.max_val)
+        target_clamped = torch.clamp(target_f32, min=0.0)
         pred_tm = mu_law_tonemap(pred_clamped, mu=self.mu)
         target_tm = mu_law_tonemap(target_clamped, mu=self.mu)
         return F.l1_loss(pred_tm, target_tm)
@@ -268,11 +279,12 @@ def train_one_epoch(
     device: torch.device,
     use_amp: bool = False,
     dry_run: bool = False,
-) -> float:
-    """Run one epoch of training and return the average loss."""
+) -> Tuple[float, int]:
+    """Run one epoch of training and return (average_loss, skipped_batches)."""
     model.train()
     running_loss = 0.0
     total_samples = 0
+    skipped_batches = 0
     amp_enabled = use_amp and (device.type == "cuda")
 
     for batch_idx, batch in enumerate(dataloader):
@@ -280,9 +292,19 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
+        # 1. Forward pass under autocast (if AMP enabled)
         with get_autocast_context(device, amp_enabled):
             predictions = model(ldr_imgs)
-            loss = criterion(predictions, hdr_gts)
+
+        # 1. Compute loss in float32 outside autocast
+        predictions_f32 = predictions.float()
+        hdr_gts_f32 = hdr_gts.float()
+        loss = criterion(predictions_f32, hdr_gts_f32)
+
+        # 3. Guard: if loss is not finite, skip batch (no backward, no optimizer step)
+        if not torch.isfinite(loss):
+            skipped_batches += 1
+            continue
 
         if amp_enabled and scaler is not None:
             scaler.scale(loss).backward()
@@ -292,13 +314,15 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
 
+        # Report average loss only over finite batches
         running_loss += loss.item() * ldr_imgs.size(0)
         total_samples += ldr_imgs.size(0)
 
         if dry_run:
             break
 
-    return running_loss / max(1, total_samples)
+    avg_loss = running_loss / total_samples if total_samples > 0 else float("nan")
+    return avg_loss, skipped_batches
 
 
 def validate(
@@ -308,14 +332,15 @@ def validate(
     device: torch.device,
     use_amp: bool = False,
     dry_run: bool = False,
-) -> float:
-    """Run evaluation on the validation set and return average loss."""
+) -> Tuple[float, int]:
+    """Run evaluation on the validation set and return (average_loss, skipped_batches)."""
     if dataloader is None or len(dataloader) == 0:
-        return 0.0
+        return 0.0, 0
 
     model.eval()
     running_loss = 0.0
     total_samples = 0
+    skipped_batches = 0
     amp_enabled = use_amp and (device.type == "cuda")
 
     with torch.no_grad():
@@ -324,7 +349,16 @@ def validate(
 
             with get_autocast_context(device, amp_enabled):
                 predictions = model(ldr_imgs)
-                loss = criterion(predictions, hdr_gts)
+
+            # 4. Validation uses the same float32 loss computation outside autocast
+            predictions_f32 = predictions.float()
+            hdr_gts_f32 = hdr_gts.float()
+            loss = criterion(predictions_f32, hdr_gts_f32)
+
+            # Skip non-finite batches to keep metrics finite
+            if not torch.isfinite(loss):
+                skipped_batches += 1
+                continue
 
             running_loss += loss.item() * ldr_imgs.size(0)
             total_samples += ldr_imgs.size(0)
@@ -332,7 +366,8 @@ def validate(
             if dry_run:
                 break
 
-    return running_loss / max(1, total_samples)
+    avg_loss = running_loss / total_samples if total_samples > 0 else float("nan")
+    return avg_loss, skipped_batches
 
 
 def build_model(
@@ -578,7 +613,7 @@ def train(
         dummy_gt = torch.rand(test_b, 3, crop_size, crop_size, device=target_device)
         with torch.no_grad():
             dummy_out = model(dummy_in)
-            dummy_loss = criterion(dummy_out, dummy_gt)
+            dummy_loss = criterion(dummy_out.float(), dummy_gt.float())
         print(f"  Dummy Input:    {tuple(dummy_in.shape)}")
         print(f"  Dummy Output:   {tuple(dummy_out.shape)}")
         print(f"  Dummy Loss:     {dummy_loss.item():.6f} ({loss_label})")
@@ -659,7 +694,7 @@ def train(
         epoch_start = time.time()
 
         # Training phase
-        train_loss = train_one_epoch(
+        train_loss, train_skipped = train_one_epoch(
             model=model,
             dataloader=train_loader,
             criterion=criterion,
@@ -671,7 +706,7 @@ def train(
         )
 
         # Validation phase
-        val_loss = validate(
+        val_loss, val_skipped = validate(
             model=model,
             dataloader=val_loader,
             criterion=criterion,
@@ -688,18 +723,22 @@ def train(
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["lr"].append(current_lr)
+        history.setdefault("skipped_batches", []).append(train_skipped)
+        history.setdefault("val_skipped_batches", []).append(val_skipped)
 
-        # Check if best model
-        is_best = val_loss < best_val_loss
+        # Check if best model (ensure finite val_loss)
+        is_best = (val_loss < best_val_loss) and not np.isnan(val_loss) and not np.isinf(val_loss)
         if is_best:
             best_val_loss = val_loss
 
         # Console logging
         best_marker = " (*Best)" if is_best else ""
+        val_skip_str = f" (val_skipped:{val_skipped})" if val_skipped > 0 else ""
         print(
             f"Epoch [{epoch:03d}/{epochs:03d}] | "
             f"Train Loss ({loss_label}): {train_loss:.6f} | "
             f"Val Loss: {val_loss:.6f}{best_marker} | "
+            f"skipped:{train_skipped}{val_skip_str} | "
             f"LR: {current_lr:.6f} | "
             f"Time: {epoch_time:.2f}s"
         )
@@ -716,6 +755,8 @@ def train(
                 "scaler_state_dict": scaler.state_dict() if (scaler is not None and amp_active) else None,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "train_skipped": train_skipped,
+                "val_skipped": val_skipped,
                 "best_val_loss": best_val_loss,
                 "history": history,
                 "config": cfg,
