@@ -87,7 +87,20 @@ def parse_args() -> argparse.Namespace:
         "--val_split",
         type=float,
         default=0.10,
-        help="Validation split ratio (default: 0.10).",
+        help="Validation split ratio when layout='folders' (default: 0.10).",
+    )
+    parser.add_argument(
+        "--val_count",
+        type=int,
+        default=300,
+        help="Number of held-out validation images for 'flat' layout (default: 300).",
+    )
+    parser.add_argument(
+        "--layout",
+        type=str,
+        default="folders",
+        choices=["folders", "flat"],
+        help="Dataset layout: 'folders' or 'flat' (default: 'folders').",
     )
     parser.add_argument(
         "--seed",
@@ -172,6 +185,8 @@ def evaluate(
     model_name: str = "rlunet",
     config_path: Optional[str] = None,
     data_dir: Optional[str] = None,
+    layout: str = "folders",
+    val_count: Optional[int] = None,
     output_dir: str = "results/figures/validation_eval",
     metrics_dir: str = "results/metrics",
     num_samples: int = 10,
@@ -190,6 +205,18 @@ def evaluate(
         target_device = torch.device(device)
     else:
         target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Resolve layout and validation parameters
+    resolved_layout = (
+        layout
+        or cfg.get("data", {}).get("layout")
+        or "folders"
+    ).lower().strip()
+    resolved_val_count = (
+        val_count
+        if val_count is not None
+        else cfg.get("data", {}).get("val_count", 300)
+    )
 
     # Resolve model
     resolved_model = model_name.strip().lower()
@@ -212,6 +239,11 @@ def evaluate(
     print(f"Model:           {model_name.upper()} ({resolved_model})")
     print(f"Total Params:    {total_params:,}")
     print(f"Device:          {target_device}")
+    print(f"Data Layout:     {resolved_layout}")
+    if resolved_layout == "flat":
+        print(f"Validation Set:  Fixed {resolved_val_count} held-out images")
+    else:
+        print(f"Validation Ratio:{val_split * 100:.1f}%")
     print(f"Mu parameter:    {mu}")
     print(f"Visual Dir:      {output_dir}")
     print(f"Metrics Dir:     {metrics_dir}")
@@ -241,7 +273,13 @@ def evaluate(
         if not os.path.isdir(data_dir):
             is_dummy_run = True
         else:
-            _, val_set = get_train_val_split(data_dir=data_dir, val_split=val_split, seed=seed)
+            _, val_set = get_train_val_split(
+                data_dir=data_dir,
+                layout=resolved_layout,
+                val_split=val_split,
+                val_count=resolved_val_count,
+                seed=seed,
+            )
             if len(val_set) == 0:
                 is_dummy_run = True
 
@@ -306,7 +344,13 @@ def evaluate(
         return results
 
     # Full real validation evaluation
-    _, val_set = get_train_val_split(data_dir=data_dir, val_split=val_split, seed=seed)
+    _, val_set = get_train_val_split(
+        data_dir=data_dir,
+        layout=resolved_layout,
+        val_split=val_split,
+        val_count=resolved_val_count,
+        seed=seed,
+    )
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
 
     print(f"Evaluating on {len(val_set)} validation sample(s)...")
@@ -379,6 +423,8 @@ def main():
         model_name=args.model,
         config_path=args.config,
         data_dir=args.data_dir,
+        layout=args.layout,
+        val_count=args.val_count,
         output_dir=args.output_dir,
         metrics_dir=args.metrics_dir,
         num_samples=args.num_samples,

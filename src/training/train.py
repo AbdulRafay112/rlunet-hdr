@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import yaml
 
-from src.data.dataset import HDRDataset
+from src.data.dataset import HDRDataset, get_train_val_split
 from src.models.baseline_unet import BaselineUNet
 from src.models.rlunet import RLUNet
 from src.utils.tonemap import mu_law_tonemap
@@ -166,7 +166,20 @@ def parse_args() -> argparse.Namespace:
         "--val_split",
         type=float,
         default=0.10,
-        help="Fraction of dataset to use for validation (default: 0.10 for 90/10 split).",
+        help="Fraction of dataset to use for validation when layout='folders' (default: 0.10 for 90/10 split).",
+    )
+    parser.add_argument(
+        "--val_count",
+        type=int,
+        default=300,
+        help="Number of held-out validation images for 'flat' layout (default: 300).",
+    )
+    parser.add_argument(
+        "--layout",
+        type=str,
+        default="folders",
+        choices=["folders", "flat"],
+        help="Dataset directory layout: 'folders' (<root>/NNNNN/input.jpg) or 'flat' (<root>/LDR_in/*.jpg, <root>/HDR_gt/*.hdr) (default: 'folders').",
     )
     parser.add_argument(
         "--dry_run",
@@ -182,54 +195,6 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
-def get_train_val_split(
-    data_dir: str,
-    val_split: float,
-    seed: int,
-    crop_size: int = 256,
-    normalize_hdr: bool = True,
-) -> Tuple[Subset, Optional[Subset]]:
-    """Create two separate HDRDataset instances (train and val) and split with the same seeded indices.
-
-    This ensures random crops and spatial augmentations apply exclusively to training images,
-    while validation evaluates on full uncropped images.
-    """
-    train_dataset = HDRDataset(
-        root_dir=data_dir,
-        split="train",
-        crop_size=crop_size,
-        normalize_hdr=normalize_hdr,
-        return_scale=True,
-    )
-    val_dataset = HDRDataset(
-        root_dir=data_dir,
-        split="val",
-        normalize_hdr=normalize_hdr,
-        return_scale=True,
-    )
-
-    total_len = len(train_dataset)
-    if total_len == 0:
-        return Subset(train_dataset, []), Subset(val_dataset, [])
-
-    if total_len == 1:
-        return Subset(train_dataset, [0]), Subset(val_dataset, [0])
-
-    val_len = int(round(total_len * val_split))
-    val_len = max(1, min(val_len, total_len - 1))
-    train_len = total_len - val_len
-
-    generator = torch.Generator().manual_seed(seed)
-    shuffled_indices = torch.randperm(total_len, generator=generator).tolist()
-
-    train_indices = shuffled_indices[:train_len]
-    val_indices = shuffled_indices[train_len:]
-
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(val_dataset, val_indices)
-
-    return train_subset, val_subset
 
 
 def save_checkpoint(
@@ -425,6 +390,8 @@ def train(
     device: Optional[str] = None,
     seed: Optional[int] = None,
     val_split: float = 0.10,
+    val_count: Optional[int] = None,
+    layout: str = "folders",
     dry_run: bool = False,
     base_channels: Optional[int] = None,
     loss_type: Optional[str] = None,
@@ -539,6 +506,18 @@ def train(
             else:
                 model_base_channels = 64
 
+    # Resolve layout and validation parameters
+    resolved_layout = (
+        layout
+        or cfg.get("data", {}).get("layout")
+        or "folders"
+    ).lower().strip()
+    resolved_val_count = (
+        val_count
+        if val_count is not None
+        else cfg.get("data", {}).get("val_count", 300)
+    )
+
     # Mixed precision setup
     amp_active = use_amp and (target_device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=amp_active) if target_device.type == "cuda" else None
@@ -551,6 +530,11 @@ def train(
     print(f"Mixed Precision:  {'Enabled (torch.cuda.amp)' if amp_active else ('Disabled (CPU)' if use_amp else 'Disabled')}")
     print(f"Device:           {target_device}")
     print(f"Data Directory:   {data_dir}")
+    print(f"Data Layout:      {resolved_layout}")
+    if resolved_layout == "flat":
+        print(f"Validation Set:   Fixed {resolved_val_count} held-out images")
+    else:
+        print(f"Validation Ratio: {val_split * 100:.1f}%")
     print(f"Checkpoints:      {checkpoint_dir}")
     print(f"Total Epochs:     {epochs}")
     print(f"Batch Size:       {batch_size}")
@@ -576,13 +560,15 @@ def train(
     # 2. Prepare Train and Val Datasets via seeded Subset
     train_set, val_set = get_train_val_split(
         data_dir=data_dir,
+        layout=resolved_layout,
         val_split=val_split,
+        val_count=resolved_val_count,
         seed=seed,
         crop_size=crop_size,
         normalize_hdr=True,
     )
     total_samples = len(train_set) + len(val_set)
-    print(f"Loaded dataset: {len(train_set)} train (with 256x256 crop & augmentations), {len(val_set)} validation (full image).")
+    print(f"Loaded dataset ({resolved_layout}): {len(train_set)} train (with 256x256 crop & augmentations), {len(val_set)} validation (full image).")
 
     if total_samples == 0:
         print("[Warning] No sample folders found in dataset directory.")
@@ -786,6 +772,8 @@ def main():
         device=args.device,
         seed=args.seed,
         val_split=args.val_split,
+        val_count=args.val_count,
+        layout=args.layout,
         dry_run=args.dry_run,
         base_channels=args.base_channels,
         loss_type=args.loss,

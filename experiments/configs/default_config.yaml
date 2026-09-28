@@ -7,6 +7,8 @@ seed: 42
 data:
   dataset_name: "Kalantari17"
   data_root: "data/processed"
+  layout: "folders"
+  val_count: 300
   crop_size: 256
   batch_size: 8
   num_workers: 4
