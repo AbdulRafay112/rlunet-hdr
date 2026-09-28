@@ -8,6 +8,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -19,15 +20,27 @@ class HDRDataset(Dataset):
       - `input.jpg`: Low Dynamic Range (LDR) input (uint8, [0, 255])
       - `gt.hdr`: High Dynamic Range (HDR) ground truth (float32, [0, ~10000+])
 
+    Features:
+      - Split-aware mode: 'train' applies joint augmentations (random 256x256 crops,
+        random horizontal/vertical flips, and random 90-degree rotations);
+        'val' / 'test' evaluates on the full uncropped image without spatial distortion.
+      - Per-image HDR max normalization: scales HDR ground truth by its max radiance
+        into [0.0, 1.0], returning the scale factor for unscaled reconstruction.
+
     Returns:
-      tuple: (ldr_tensor, hdr_tensor)
+      Tuple[torch.Tensor, torch.Tensor] or Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         - `ldr_tensor`: FloatTensor of shape (3, H, W) normalized to [0.0, 1.0].
-        - `hdr_tensor`: FloatTensor of shape (3, H, W) with original physical radiance.
+        - `hdr_tensor`: FloatTensor of shape (3, H, W) (normalized if normalize_hdr=True).
+        - (Optional) `scale_factor`: FloatTensor scalar if return_scale=True.
     """
 
     def __init__(
         self,
         root_dir: Union[str, Path],
+        split: str = "train",
+        crop_size: int = 256,
+        normalize_hdr: bool = True,
+        return_scale: bool = True,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         joint_transform: Optional[Callable] = None,
@@ -39,16 +52,23 @@ class HDRDataset(Dataset):
 
         Args:
             root_dir: Root path containing numbered sample subfolders (e.g., 'data/HDR-Real/HDR-Real').
+            split: Dataset split ('train', 'val', or 'test'). Training enables augmentations.
+            crop_size: Size of random square crop for training (default: 256).
+            normalize_hdr: If True, normalizes HDR image by its per-image maximum (default: True).
+            return_scale: If True, returns (ldr, hdr, scale_factor). If False, (ldr, hdr) (default: True).
             transform: Optional transform callable applied to the LDR tensor.
             target_transform: Optional transform callable applied to the HDR tensor.
             joint_transform: Optional callable applied jointly to (ldr_tensor, hdr_tensor).
             ldr_filename: Filename of the LDR image in each folder (default: 'input.jpg').
             hdr_filename: Filename of the HDR image in each folder (default: 'gt.hdr').
             check_missing: If True, filters out subfolders missing input/gt files at init.
-                           If False, verifies files on demand during __getitem__.
         """
         super().__init__()
         self.root_dir = Path(root_dir)
+        self.split = split.lower().strip()
+        self.crop_size = crop_size
+        self.normalize_hdr = normalize_hdr
+        self.return_scale = return_scale
         self.transform = transform
         self.target_transform = target_transform
         self.joint_transform = joint_transform
@@ -84,18 +104,15 @@ class HDRDataset(Dataset):
 
     def _scan_sample_folders(self) -> List[Path]:
         """Scan root_dir for numbered subfolders and sort them numerically."""
-        # Check direct subfolders first
         subfolders = [
             d for d in self.root_dir.iterdir() if d.is_dir() and d.name.isdigit()
         ]
 
-        # If no direct numbered folders found, search recursively
         if not subfolders:
             subfolders = [
                 d for d in self.root_dir.rglob("*") if d.is_dir() and d.name.isdigit()
             ]
 
-        # Sort numerically by folder name, with fallback to alphabetical string sort
         subfolders.sort(
             key=lambda p: (int(p.name) if p.name.isdigit() else p.name, str(p))
         )
@@ -117,81 +134,117 @@ class HDRDataset(Dataset):
             )
         return self.sample_dirs[index]
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load and return an (ldr_tensor, hdr_tensor) pair.
+    def _apply_joint_augmentations(
+        self, ldr: torch.Tensor, hdr: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply random crop, horizontal/vertical flips, and 90-degree rotations jointly."""
+        _, h, w = ldr.shape
+
+        # 1. Random Crop to (crop_size, crop_size)
+        if self.crop_size is not None and self.crop_size > 0:
+            pad_h = max(0, self.crop_size - h)
+            pad_w = max(0, self.crop_size - w)
+            if pad_h > 0 or pad_w > 0:
+                # Pad to at least crop_size with reflection (or replicate if too small)
+                pad_mode = "reflect" if (pad_h < h and pad_w < w) else "replicate"
+                padding = [0, pad_w, 0, pad_h]
+                ldr = F.pad(ldr.unsqueeze(0), padding, mode=pad_mode).squeeze(0)
+                hdr = F.pad(hdr.unsqueeze(0), padding, mode=pad_mode).squeeze(0)
+                _, h, w = ldr.shape
+
+            top = int(torch.randint(0, h - self.crop_size + 1, (1,)).item())
+            left = int(torch.randint(0, w - self.crop_size + 1, (1,)).item())
+            ldr = ldr[:, top : top + self.crop_size, left : left + self.crop_size]
+            hdr = hdr[:, top : top + self.crop_size, left : left + self.crop_size]
+
+        # 2. Random Horizontal Flip (50% prob)
+        if torch.rand(1).item() > 0.5:
+            ldr = torch.flip(ldr, dims=[2])
+            hdr = torch.flip(hdr, dims=[2])
+
+        # 3. Random Vertical Flip (50% prob)
+        if torch.rand(1).item() > 0.5:
+            ldr = torch.flip(ldr, dims=[1])
+            hdr = torch.flip(hdr, dims=[1])
+
+        # 4. Random 90-degree rotation (0, 90, 180, or 270 degrees)
+        rot_k = int(torch.randint(0, 4, (1,)).item())
+        if rot_k > 0:
+            ldr = torch.rot90(ldr, rot_k, dims=[1, 2])
+            hdr = torch.rot90(hdr, rot_k, dims=[1, 2])
+
+        return ldr, hdr
+
+    def __getitem__(self, index: int) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Load and return an LDR/HDR pair with optional scale factor.
 
         Args:
             index: Index of the sample to retrieve.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - ldr_tensor: torch.FloatTensor of shape (3, H, W) normalized to [0, 1].
-                - hdr_tensor: torch.FloatTensor of shape (3, H, W) in float32 radiance values.
-
-        Raises:
-            FileNotFoundError: If input.jpg or gt.hdr is missing in the sample folder.
-            IOError: If OpenCV fails to read/decode either image.
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor] (if return_scale=True)
+            Tuple[torch.Tensor, torch.Tensor] (if return_scale=False)
         """
         sample_dir = self.get_sample_path(index)
         ldr_path = sample_dir / self.ldr_filename
         hdr_path = sample_dir / self.hdr_filename
 
-        # Basic error handling for missing files
         if not ldr_path.is_file():
             raise FileNotFoundError(
-                f"LDR image file '{self.ldr_filename}' not found in sample directory: '{sample_dir}'"
+                f"LDR image file '{self.ldr_filename}' not found in: '{sample_dir}'"
             )
         if not hdr_path.is_file():
             raise FileNotFoundError(
-                f"HDR ground truth file '{self.hdr_filename}' not found in sample directory: '{sample_dir}'"
+                f"HDR ground truth file '{self.hdr_filename}' not found in: '{sample_dir}'"
             )
 
         # Load LDR image (uint8, 0-255)
         ldr_bgr = cv2.imread(str(ldr_path), cv2.IMREAD_COLOR)
         if ldr_bgr is None:
-            raise IOError(
-                f"Failed to read LDR image at '{ldr_path}'. The file may be corrupted or unreadable."
-            )
-        # Convert BGR to RGB
+            raise IOError(f"Failed to read LDR image at '{ldr_path}'.")
         ldr_rgb = cv2.cvtColor(ldr_bgr, cv2.COLOR_BGR2RGB)
 
         # Load HDR image (float32, 0 to ~10000+)
-        # cv2.IMREAD_ANYDEPTH preserves 32-bit floating-point depth.
-        # Combined with IMREAD_COLOR to ensure 3 color channels are read.
         hdr_img = cv2.imread(str(hdr_path), cv2.IMREAD_ANYDEPTH)
         if hdr_img is None or hdr_img.ndim == 2:
-            hdr_color = cv2.imread(
-                str(hdr_path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR
-            )
+            hdr_color = cv2.imread(str(hdr_path), cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
             if hdr_color is not None:
                 hdr_img = hdr_color
 
         if hdr_img is None:
-            raise IOError(
-                f"Failed to read HDR ground truth at '{hdr_path}'. The file may be corrupted or unreadable."
-            )
+            raise IOError(f"Failed to read HDR ground truth at '{hdr_path}'.")
 
-        # Ensure 3 channels and convert BGR to RGB
         if hdr_img.ndim == 2:
             hdr_img = np.stack([hdr_img] * 3, axis=-1)
         elif hdr_img.ndim == 3 and hdr_img.shape[2] == 3:
             hdr_img = cv2.cvtColor(hdr_img, cv2.COLOR_BGR2RGB)
 
-        # Convert LDR to float32 tensor normalized to [0, 1] with shape (3, H, W)
+        # Convert to float32 tensors with shape (3, H, W)
         ldr_tensor = (
             torch.from_numpy(ldr_rgb.astype(np.float32) / 255.0)
             .permute(2, 0, 1)
             .contiguous()
         )
-
-        # Convert HDR to float32 tensor with shape (3, H, W)
         hdr_tensor = (
             torch.from_numpy(hdr_img.astype(np.float32))
             .permute(2, 0, 1)
             .contiguous()
         )
 
-        # Apply transformations if provided
+        # Apply training augmentations if in training split
+        if self.split == "train":
+            ldr_tensor, hdr_tensor = self._apply_joint_augmentations(ldr_tensor, hdr_tensor)
+
+        # Per-image HDR max normalization
+        if self.normalize_hdr:
+            max_val = hdr_tensor.max().item()
+            scale = max(float(max_val), 1e-6)
+            hdr_tensor = hdr_tensor / scale
+            scale_tensor = torch.tensor(scale, dtype=torch.float32)
+        else:
+            scale_tensor = torch.tensor(1.0, dtype=torch.float32)
+
+        # Apply optional custom transforms
         if self.transform is not None:
             ldr_tensor = self.transform(ldr_tensor)
         if self.target_transform is not None:
@@ -199,41 +252,31 @@ class HDRDataset(Dataset):
         if self.joint_transform is not None:
             ldr_tensor, hdr_tensor = self.joint_transform(ldr_tensor, hdr_tensor)
 
+        if self.return_scale:
+            return ldr_tensor, hdr_tensor, scale_tensor
         return ldr_tensor, hdr_tensor
 
 
-# Alias for convenience and project naming convention
+# Alias for convenience
 RLUNetDataset = HDRDataset
 
+
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
 
     sample_root = Path("data/HDR-Real/HDR-Real")
     if not sample_root.exists():
         sample_root = Path(__file__).resolve().parents[2] / "data" / "HDR-Real" / "HDR-Real"
 
-    print(f"--- Running Usage Example for HDRDataset ---")
-    print(f"Loading HDRDataset from: {sample_root}")
-    dataset = HDRDataset(root_dir=sample_root)
-
-    print(f"Total samples found: {len(dataset)}")
-    for idx in range(len(dataset)):
-        print(f"  Sample {idx}: {dataset.get_sample_path(idx)}")
-
-    ldr_tensor, hdr_tensor = dataset[0]
-    print(
-        f"\nSample [0] Details:"
-        f"\n  LDR Tensor -> shape: {ldr_tensor.shape}, dtype: {ldr_tensor.dtype}, range: [{ldr_tensor.min().item():.4f}, {ldr_tensor.max().item():.4f}]"
-        f"\n  HDR Tensor -> shape: {hdr_tensor.shape}, dtype: {hdr_tensor.dtype}, range: [{hdr_tensor.min().item():.4f}, {hdr_tensor.max().item():.4f}]"
-    )
-
-    # DataLoader test
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
-    batch_ldr, batch_hdr = next(iter(dataloader))
-    print(
-        f"\nDataLoader (batch_size=2):"
-        f"\n  Batch LDR Tensor -> shape: {batch_ldr.shape}, dtype: {batch_ldr.dtype}"
-        f"\n  Batch HDR Tensor -> shape: {batch_hdr.shape}, dtype: {batch_hdr.dtype}"
-    )
-    print("\n[SUCCESS] HDRDataset usage example executed successfully!")
-
+    print("--- Testing HDRDataset Implementation ---")
+    print(f"Sample root path: {sample_root}")
+    if sample_root.exists() and len(list(sample_root.iterdir())) > 0:
+        ds_train = HDRDataset(sample_root, split="train", crop_size=256, normalize_hdr=True)
+        ds_val = HDRDataset(sample_root, split="val", normalize_hdr=True)
+        print(f"Samples found: {len(ds_train)}")
+        ldr_tr, hdr_tr, scale_tr = ds_train[0]
+        print(f"Train sample 0 -> LDR: {ldr_tr.shape}, HDR: {hdr_tr.shape}, Scale: {scale_tr.item():.4f}")
+        ldr_val, hdr_val, scale_val = ds_val[0]
+        print(f"Val sample 0   -> LDR: {ldr_val.shape}, HDR: {hdr_val.shape}, Scale: {scale_val.item():.4f}")
+    else:
+        print("[Notice] Real dataset not found on disk; unit tests will verify with synthetic data.")

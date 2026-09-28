@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 # Ensure project root is in sys.path for direct script execution
 project_root = str(Path(__file__).resolve().parents[2])
@@ -15,12 +15,30 @@ if project_root not in sys.path:
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
 import yaml
 
 from src.data.dataset import HDRDataset
 from src.models.baseline_unet import BaselineUNet
 from src.models.rlunet import RLUNet
+from src.utils.tonemap import mu_law_tonemap
+
+
+class MuLawLoss(nn.Module):
+    """L1 loss in the mu-law tone-mapped domain: T(x) = log(1 + mu*x) / log(1 + mu)."""
+
+    def __init__(self, mu: float = 5000.0):
+        super().__init__()
+        self.mu = mu
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Clamp predictions to non-negative to avoid negative values inside log1p
+        pred_clamped = torch.clamp(pred, min=0.0)
+        target_clamped = torch.clamp(target, min=0.0)
+        pred_tm = mu_law_tonemap(pred_clamped, mu=self.mu)
+        target_tm = mu_law_tonemap(target_clamped, mu=self.mu)
+        return F.l1_loss(pred_tm, target_tm)
 
 
 def load_config(config_path: Optional[str]) -> Dict[str, Any]:
@@ -45,10 +63,28 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture to train (choices: 'baseline', 'rlunet'; default: 'rlunet').",
     )
     parser.add_argument(
+        "--loss",
+        type=str,
+        default="mulaw",
+        choices=["mulaw", "l1"],
+        help="Loss function type: 'mulaw' for tone-mapped L1 (mu=5000), 'l1' for raw L1 (default: 'mulaw').",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable automatic mixed precision (AMP) using torch.cuda.amp.",
+    )
+    parser.add_argument(
         "--base_channels",
         type=int,
         default=None,
         help="Base feature channels for the model (defaults to 32 for RLUNet [~7.79M], 64 for BaselineUNet [~31.04M]).",
+    )
+    parser.add_argument(
+        "--crop_size",
+        type=int,
+        default=256,
+        help="Random crop size for training images (default: 256).",
     )
     parser.add_argument(
         "--config",
@@ -148,28 +184,52 @@ def set_seed(seed: int) -> None:
 
 
 def get_train_val_split(
-    dataset: HDRDataset, val_split: float, seed: int
-) -> Tuple[torch.utils.data.Dataset, Optional[torch.utils.data.Dataset]]:
-    """Split dataset into 90% training and 10% validation subsets."""
-    total_len = len(dataset)
+    data_dir: str,
+    val_split: float,
+    seed: int,
+    crop_size: int = 256,
+    normalize_hdr: bool = True,
+) -> Tuple[Subset, Optional[Subset]]:
+    """Create two separate HDRDataset instances (train and val) and split with the same seeded indices.
+
+    This ensures random crops and spatial augmentations apply exclusively to training images,
+    while validation evaluates on full uncropped images.
+    """
+    train_dataset = HDRDataset(
+        root_dir=data_dir,
+        split="train",
+        crop_size=crop_size,
+        normalize_hdr=normalize_hdr,
+        return_scale=True,
+    )
+    val_dataset = HDRDataset(
+        root_dir=data_dir,
+        split="val",
+        normalize_hdr=normalize_hdr,
+        return_scale=True,
+    )
+
+    total_len = len(train_dataset)
     if total_len == 0:
-        raise ValueError("Cannot split an empty dataset.")
+        return Subset(train_dataset, []), Subset(val_dataset, [])
 
     if total_len == 1:
-        # Single sample edge-case: use for both or warn
-        return dataset, dataset
+        return Subset(train_dataset, [0]), Subset(val_dataset, [0])
 
     val_len = int(round(total_len * val_split))
-    val_len = max(1, val_len)  # At least 1 validation sample if total_len > 1
+    val_len = max(1, min(val_len, total_len - 1))
     train_len = total_len - val_len
 
-    if train_len == 0:
-        train_len = 1
-        val_len = total_len - 1
-
     generator = torch.Generator().manual_seed(seed)
-    train_set, val_set = random_split(dataset, [train_len, val_len], generator=generator)
-    return train_set, val_set
+    shuffled_indices = torch.randperm(total_len, generator=generator).tolist()
+
+    train_indices = shuffled_indices[:train_len]
+    val_indices = shuffled_indices[train_len:]
+
+    train_subset = Subset(train_dataset, train_indices)
+    val_subset = Subset(val_dataset, val_indices)
+
+    return train_subset, val_subset
 
 
 def save_checkpoint(
@@ -213,28 +273,59 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     return None
 
 
+def unpack_batch(
+    batch: Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Unpack batch supporting either (ldr, hdr) or (ldr, hdr, scale_factor)."""
+    if len(batch) == 3:
+        ldr, hdr, scale = batch
+        return ldr.to(device, non_blocking=True), hdr.to(device, non_blocking=True), scale.to(device, non_blocking=True)
+    else:
+        ldr, hdr = batch
+        return ldr.to(device, non_blocking=True), hdr.to(device, non_blocking=True), None
+
+
+def get_autocast_context(device: torch.device, enabled: bool):
+    """Return device-appropriate autocast context manager."""
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    if hasattr(torch, "autocast"):
+        return torch.autocast(device_type=device_type, enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled and device.type == "cuda")
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scaler: Optional[torch.cuda.amp.GradScaler],
     device: torch.device,
+    use_amp: bool = False,
     dry_run: bool = False,
 ) -> float:
     """Run one epoch of training and return the average loss."""
     model.train()
     running_loss = 0.0
     total_samples = 0
+    amp_enabled = use_amp and (device.type == "cuda")
 
-    for batch_idx, (ldr_imgs, hdr_gts) in enumerate(dataloader):
-        ldr_imgs = ldr_imgs.to(device, non_blocking=True)
-        hdr_gts = hdr_gts.to(device, non_blocking=True)
+    for batch_idx, batch in enumerate(dataloader):
+        ldr_imgs, hdr_gts, _ = unpack_batch(batch, device)
 
         optimizer.zero_grad()
-        predictions = model(ldr_imgs)
-        loss = criterion(predictions, hdr_gts)
-        loss.backward()
-        optimizer.step()
+
+        with get_autocast_context(device, amp_enabled):
+            predictions = model(ldr_imgs)
+            loss = criterion(predictions, hdr_gts)
+
+        if amp_enabled and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         running_loss += loss.item() * ldr_imgs.size(0)
         total_samples += ldr_imgs.size(0)
@@ -250,6 +341,7 @@ def validate(
     dataloader: Optional[DataLoader],
     criterion: nn.Module,
     device: torch.device,
+    use_amp: bool = False,
     dry_run: bool = False,
 ) -> float:
     """Run evaluation on the validation set and return average loss."""
@@ -259,14 +351,15 @@ def validate(
     model.eval()
     running_loss = 0.0
     total_samples = 0
+    amp_enabled = use_amp and (device.type == "cuda")
 
     with torch.no_grad():
-        for ldr_imgs, hdr_gts in dataloader:
-            ldr_imgs = ldr_imgs.to(device, non_blocking=True)
-            hdr_gts = hdr_gts.to(device, non_blocking=True)
+        for batch in dataloader:
+            ldr_imgs, hdr_gts, _ = unpack_batch(batch, device)
 
-            predictions = model(ldr_imgs)
-            loss = criterion(predictions, hdr_gts)
+            with get_autocast_context(device, amp_enabled):
+                predictions = model(ldr_imgs)
+                loss = criterion(predictions, hdr_gts)
 
             running_loss += loss.item() * ldr_imgs.size(0)
             total_samples += ldr_imgs.size(0)
@@ -334,6 +427,9 @@ def train(
     val_split: float = 0.10,
     dry_run: bool = False,
     base_channels: Optional[int] = None,
+    loss_type: Optional[str] = None,
+    use_amp: bool = False,
+    crop_size: int = 256,
 ) -> Dict[str, Any]:
     """Main training routine."""
     cfg = load_config(config_path)
@@ -357,6 +453,20 @@ def train(
         raise ValueError(
             f"Unsupported model type '{raw_model}'. Expected 'baseline' or 'rlunet'."
         )
+
+    # Resolve loss type
+    raw_loss = (
+        loss_type
+        or cfg.get("train", {}).get("loss_type")
+        or "mulaw"
+    )
+    resolved_loss_type = raw_loss.strip().lower()
+    if "mulaw" in resolved_loss_type or "mu_law" in resolved_loss_type:
+        criterion = MuLawLoss(mu=5000.0)
+        loss_label = "MuLawLoss (mu=5000)"
+    else:
+        criterion = nn.L1Loss()
+        loss_label = "Raw L1Loss"
 
     data_dir = (
         data_dir
@@ -429,10 +539,16 @@ def train(
             else:
                 model_base_channels = 64
 
+    # Mixed precision setup
+    amp_active = use_amp and (target_device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_active) if target_device.type == "cuda" else None
+
     print("=" * 65)
     print(f"RLUNet Project - {model_display_name} Training")
     print("=" * 65)
     print(f"Model:            {model_display_name} ({model_type})")
+    print(f"Loss Function:    {loss_label}")
+    print(f"Mixed Precision:  {'Enabled (torch.cuda.amp)' if amp_active else ('Disabled (CPU)' if use_amp else 'Disabled')}")
     print(f"Device:           {target_device}")
     print(f"Data Directory:   {data_dir}")
     print(f"Checkpoints:      {checkpoint_dir}")
@@ -457,26 +573,32 @@ def train(
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model Parameters: {total_params:,} (Trainable: {trainable_params:,})")
 
-    # 2. Prepare Dataset and 90/10 Train/Val Split
-    full_dataset = HDRDataset(root_dir=data_dir)
-    total_samples = len(full_dataset)
-    print(f"Loaded dataset with {total_samples} total sample(s).")
+    # 2. Prepare Train and Val Datasets via seeded Subset
+    train_set, val_set = get_train_val_split(
+        data_dir=data_dir,
+        val_split=val_split,
+        seed=seed,
+        crop_size=crop_size,
+        normalize_hdr=True,
+    )
+    total_samples = len(train_set) + len(val_set)
+    print(f"Loaded dataset: {len(train_set)} train (with 256x256 crop & augmentations), {len(val_set)} validation (full image).")
 
     if total_samples == 0:
         print("[Warning] No sample folders found in dataset directory.")
         print(f"--> Running dummy verification test for {model_display_name}...")
         test_b = min(batch_size, 2)
-        dummy_in = torch.rand(test_b, 3, 512, 512, device=target_device)
+        dummy_in = torch.rand(test_b, 3, crop_size, crop_size, device=target_device)
+        dummy_gt = torch.rand(test_b, 3, crop_size, crop_size, device=target_device)
         with torch.no_grad():
             dummy_out = model(dummy_in)
-        print(f"  Dummy Input:   {tuple(dummy_in.shape)}")
-        print(f"  Dummy Output:  {tuple(dummy_out.shape)}")
-        print(f"  Model Params:  {total_params:,}")
+            dummy_loss = criterion(dummy_out, dummy_gt)
+        print(f"  Dummy Input:    {tuple(dummy_in.shape)}")
+        print(f"  Dummy Output:   {tuple(dummy_out.shape)}")
+        print(f"  Dummy Loss:     {dummy_loss.item():.6f} ({loss_label})")
+        print(f"  Model Params:   {total_params:,}")
         print(f"[SUCCESS] {model_display_name} verification passed ({total_params:,} parameters)!")
         return {"model": model, "total_params": total_params, "verified": True}
-
-    train_set, val_set = get_train_val_split(full_dataset, val_split=val_split, seed=seed)
-    print(f"Dataset split (90/10): {len(train_set)} train, {len(val_set)} validation.")
 
     pin_memory = target_device.type == "cuda"
     train_loader = DataLoader(
@@ -494,13 +616,10 @@ def train(
         pin_memory=pin_memory,
     )
 
-    # 3. Loss function & Optimizer
-    criterion = nn.L1Loss()
+    # 3. Optimizer & Scheduler
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
-
-    # Optional learning rate scheduler
     lr_decay_step = cfg.get("train", {}).get("lr_decay_step", 40)
     lr_gamma = cfg.get("train", {}).get("lr_gamma", 0.5)
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -531,9 +650,17 @@ def train(
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint.get("epoch", 0) + 1
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        if "scheduler_state_dict" in checkpoint and scheduler is not None:
+        if "scheduler_state_dict" in checkpoint and scheduler is not None and checkpoint["scheduler_state_dict"] is not None:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        if "history" in checkpoint:
+
+        # Gracefully load scaler state if available (does not crash on old checkpoints)
+        if "scaler_state_dict" in checkpoint and scaler is not None and checkpoint["scaler_state_dict"] is not None:
+            try:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            except Exception as e:
+                print(f"[Warning] Could not load scaler state dict: {e}")
+
+        if "history" in checkpoint and checkpoint["history"] is not None:
             history = checkpoint["history"]
         print(f"--> Resumed at Epoch {start_epoch} (Best Val Loss so far: {best_val_loss:.6f})")
 
@@ -551,7 +678,9 @@ def train(
             dataloader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
+            scaler=scaler,
             device=target_device,
+            use_amp=amp_active,
             dry_run=dry_run,
         )
 
@@ -561,6 +690,7 @@ def train(
             dataloader=val_loader,
             criterion=criterion,
             device=target_device,
+            use_amp=amp_active,
             dry_run=dry_run,
         )
 
@@ -582,8 +712,8 @@ def train(
         best_marker = " (*Best)" if is_best else ""
         print(
             f"Epoch [{epoch:03d}/{epochs:03d}] | "
-            f"Train Loss (L1): {train_loss:.6f} | "
-            f"Val Loss (L1): {val_loss:.6f}{best_marker} | "
+            f"Train Loss ({loss_label}): {train_loss:.6f} | "
+            f"Val Loss: {val_loss:.6f}{best_marker} | "
             f"LR: {current_lr:.6f} | "
             f"Time: {epoch_time:.2f}s"
         )
@@ -597,11 +727,14 @@ def train(
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict() if (scaler is not None and amp_active) else None,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "best_val_loss": best_val_loss,
                 "history": history,
                 "config": cfg,
+                "loss_type": resolved_loss_type,
+                "amp": amp_active,
             }
             if should_save_periodic:
                 filename = f"checkpoint_epoch_{epoch:04d}.pth"
@@ -655,9 +788,11 @@ def main():
         val_split=args.val_split,
         dry_run=args.dry_run,
         base_channels=args.base_channels,
+        loss_type=args.loss,
+        use_amp=args.amp,
+        crop_size=args.crop_size,
     )
 
 
 if __name__ == "__main__":
     main()
-
